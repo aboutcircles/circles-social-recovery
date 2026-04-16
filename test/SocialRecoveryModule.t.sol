@@ -7,6 +7,7 @@ import {HubStorageWrites} from "./helpers/HubStorageWrites.sol";
 import {IModuleManager} from "src/interfaces/IModuleManager.sol";
 import {SocialRecoveryModule} from "src/SocialRecoveryModule.sol";
 
+///@dev mstore(0x20, keccak256(0, 0x40)) from line 708 should be removed to make the tests valid
 contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
     /// @notice The current day, calculated from the block timestamp.
     uint64 public day;
@@ -615,5 +616,19 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         );
 
         srModule.initiateRecovery(address(_user), _newPasskey);
+    }
+
+    function testReadLinkedList() public{
+
+            address _newPasskey =
+            _enableModuleAndInitiateRecovery(alice, guardiansList, guardiansList.length, minimumCooldown);
+
+        (
+            address initiator,
+            address newPasskey,
+            uint256 approvalCount,
+            uint256 initiationTimestamp,
+            address[] memory approvingGuardians
+        ) = srModule.getRecovery(address(alice));
     }
 }
