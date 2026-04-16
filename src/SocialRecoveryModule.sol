@@ -429,7 +429,6 @@ contract SocialRecoveryModule {
                 }
             }
         }
-
         if (guardiansCount == 1) {
             if (activeRecovery) _removeRecovery(safe);
             // remove configuration
@@ -702,10 +701,7 @@ contract SocialRecoveryModule {
     /// @return linkedList In-memory array containing list elements in traversal order.
     function _getLinkedList(address next, uint256 initSlot) internal view returns (address[] memory linkedList) {
         assembly {
-            // Calculate and store the storage slot
-            mstore(0, next)
             mstore(0x20, initSlot)
-            mstore(0x20, keccak256(0, 0x40))
             // Store the array at the free memory location
             linkedList := mload(0x40)
             // Update free memory pointer
