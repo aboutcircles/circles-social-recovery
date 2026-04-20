@@ -429,7 +429,6 @@ contract SocialRecoveryModule {
                 }
             }
         }
-
         if (guardiansCount == 1) {
             if (activeRecovery) _removeRecovery(safe);
             // remove configuration
@@ -539,19 +538,17 @@ contract SocialRecoveryModule {
             revert RecoveryPeriodNotEnded();
         }
 
-        if (_getApprovalCount(safe) >= _getThreshold(safe)) {
-            address newPasskey = _getNewPasskey(safe);
-            _addRecoveryOwner(safe, newPasskey);
+        bool ok = _getApprovalCount(safe) >= _getThreshold(safe);
+        address newPasskey = _getNewPasskey(safe);
+        address[] memory approvers = _getArrayFromList(_approvingGuardiansSlot(safe), _getApprovingGuardiansList(safe));
 
-            emit RecoveryExecuted(
-                safe, newPasskey, _getArrayFromList(_approvingGuardiansSlot(safe), _getApprovingGuardiansList(safe))
-            );
+        _removeRecovery(safe);
+        if (ok) {
+            _addRecoveryOwner(safe, newPasskey);
+            emit RecoveryExecuted(safe, newPasskey, approvers);
         } else {
             emit RecoveryExpiredInsufficientApprovals(safe);
         }
-
-        // clean
-        _removeRecovery(safe);
     }
 
     /// @notice Cancels an expired recovery that failed to reach threshold.
@@ -702,12 +699,12 @@ contract SocialRecoveryModule {
     /// @return linkedList In-memory array containing list elements in traversal order.
     function _getLinkedList(address next, uint256 initSlot) internal view returns (address[] memory linkedList) {
         assembly {
-            // Calculate and store the storage slot
-            mstore(0, next)
+            // Store the mapping storage slot
             mstore(0x20, initSlot)
-            mstore(0x20, keccak256(0, 0x40))
             // Store the array at the free memory location
             linkedList := mload(0x40)
+            // clean linked list word
+            mstore(linkedList, 0x0000000000000000000000000000000000000000000000000000000000000000)
             // Update free memory pointer
             mstore(0x40, add(mload(0x40), 0x20))
             // Start with the first node from solidity
