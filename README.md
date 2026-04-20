@@ -36,7 +36,14 @@ Enable Circles GApp users (Safe accounts) to recover access to their account whe
 | **Guardian**          | `initiateRecovery`, `approveRecovery`, `revokeRecoveryApproval`, `optOutAsGuardian`                                                |
 | **Anyone**            | `executeRecovery`, `cancelExpiredRecovery`, `getConfiguration`, `getRecovery`, `getWards`                                          |
 
+Notes:
+
+- `cancelRecovery()` and `cancelExpiredRecovery(safe)` **silently no-op** when their preconditions are not met (no active recovery; or recovery not yet expired / still above threshold). They do not revert.
+- `executeRecovery(safe)` is callable by anyone once the cooldown has elapsed and is the function that actually adds the new passkey as a Safe owner.
+
 ## 4. Contract Dependencies
+
+Deployed on Gnosis Chain (chain ID 100).
 
 | Contract                     | Address                                      | Purpose                                                                        |
 | ---------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------ |
@@ -75,7 +82,9 @@ wards[guardian] => mapping(address => address)  // sentinel-linked list of Safes
 - `msg.sender` (Safe) must be human per `HUB.isHuman()`
 - This module must be enabled on the Safe (`isModuleEnabled`)
 - Safe must NOT already be configured (`threshold == 0`)
-- `threshold >= 1` and `threshold <= guardians.length`
+- `guardians.length >= 1` (enforced via `_setGuardiansCount` → `InvalidGuardiansCount`)
+- `threshold <= guardians.length` (checked up-front in `configure` → `ThresholdCannotBeReached`)
+- `threshold >= 1` (enforced via `_setThreshold` → `InvalidThreshold`)
 - `recoveryCooldown >= MINIMUM_COOLDOWN`
 - Each guardian: must be human, must have mutual trust with Safe, cannot be the Safe itself, no duplicates
 
@@ -88,13 +97,13 @@ wards[guardian] => mapping(address => address)  // sentinel-linked list of Safes
 
 All reconfiguration functions (`updateThreshold`, `updateRecoveryCooldown`, `addGuardian`, `removeGuardian`) **cancel any active recovery** before applying changes. This is by design: if the Safe can call these, it still has access and recovery is unnecessary.
 
-| Function                    | Key constraints                                                  |
-| --------------------------- | ---------------------------------------------------------------- |
-| `updateThreshold(t)`        | `t <= guardiansCount`                                            |
-| `updateRecoveryCooldown(c)` | `c >= MINIMUM_COOLDOWN`                                          |
-| `addGuardian(g, t)`         | `t <= guardiansCount + 1`; guardian must be human + mutual trust |
-| `removeGuardian(g, t)`      | `t <= guardiansCount - 1`; guardian must exist in list           |
-| `removeConfiguration()`     | Removes config + all ward references                             |
+| Function                    | Key constraints                                                                                                                                                                   |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `updateThreshold(t)`        | `t >= 1` and `t <= guardiansCount`                                                                                                                                                |
+| `updateRecoveryCooldown(c)` | `c >= MINIMUM_COOLDOWN`                                                                                                                                                           |
+| `addGuardian(g, t)`         | `t >= 1` and `t <= guardiansCount + 1`; guardian must be human + mutual trust; threshold is rewritten only when `t` differs from the current threshold                            |
+| `removeGuardian(g, t)`      | `t >= 1` and `t <= guardiansCount - 1`; guardian must exist in list. Because `t >= 1` is enforced, it is not possible to remove the last remaining guardian via this function     |
+| `removeConfiguration()`     | Removes config + all ward references                                                                                                                                              |
 
 ## 7. Recovery Workflow
 
@@ -264,7 +273,9 @@ flowchart TD
     O --> P[Emit GuardianOptedOut]
 ```
 
-## 12. Passkey Validation
+Note: if the opting-out guardian is the recovery initiator **and** also the last remaining guardian, the implementation calls `_removeRecovery` twice — once in the initiator branch and once again in the `guardiansCount == 1` branch (guarded by the locally-captured `activeRecovery` flag). The second call is a no-op on already-zeroed state but explains why both code paths appear.
+
+## 9. Passkey Validation
 
 The `_isValidPasskey` function verifies that the proposed `newPasskey` address is a legitimate Safe WebAuthn signer proxy:
 
@@ -273,7 +284,7 @@ The `_isValidPasskey` function verifies that the proposed `newPasskey` address i
 3. Compares derived address with `passkey` — must match exactly
 4. If `getConfiguration()` reverts (e.g., not a proxy), returns `false`
 
-## 13. Execution: Module Transaction
+## 10. Execution: Module Transaction
 
 On successful recovery (`approvalCount >= threshold` after cooldown):
 
@@ -284,7 +295,9 @@ On successful recovery (`approvalCount >= threshold` after cooldown):
 
 The new passkey becomes an **additional** owner. The Safe owner threshold remains unchanged.
 
-## 15. Recovery Timeline
+## 11. Recovery Timeline
+
+Execution has no upper time bound: once the cooldown elapses, `executeRecovery` (or `cancelExpiredRecovery` when approvals are below threshold) can be called at any later time.
 
 ```mermaid
 gantt
@@ -294,12 +307,12 @@ gantt
 
     section Phases
     Cooldown Period (approve/revoke allowed) :active, cooldown, 0, 604800
-    Execution Window (execute allowed)       :exec, 604800, 1209600
+    Execution Phase (execute allowed, open-ended) :exec, 604800, 2000000
 
     section Actions
     initiateRecovery (t=0)             :milestone, m1, 0, 0
     approveRecovery (during cooldown)  :milestone, m2, 300000, 300000
     revokeRecovery (during cooldown)   :milestone, m3, 400000, 400000
     Cooldown expires                   :milestone, m4, 604800, 604800
-    executeRecovery (after cooldown)   :milestone, m5, 604801, 604801
+    executeRecovery (any time after)   :milestone, m5, 604801, 604801
 ```
