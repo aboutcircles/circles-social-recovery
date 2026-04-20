@@ -1,13 +1,36 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity ^0.8.28;
 
+import {stdError} from "forge-std/StdError.sol";
 import {Test, console} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {CirclesV2Setup, ISafeWebAuthnSignerFactory} from "./helpers/CirclesV2Setup.sol";
 import {HubStorageWrites} from "./helpers/HubStorageWrites.sol";
+import {ReentrantSafe} from "./helpers/ReentrantSafe.sol";
+import {EvilGuardian} from "./helpers/EvilGuardian.sol";
 import {IModuleManager} from "src/interfaces/IModuleManager.sol";
 import {SocialRecoveryModule} from "src/SocialRecoveryModule.sol";
 
-///@dev mstore(0x20, keccak256(0, 0x40)) from line 708 should be removed to make the tests valid
+/// @title SocialRecoveryModuleTest
+/// @notice End-to-end test suite for `SocialRecoveryModule`, exercised against a
+///         live Circles v2 Hub fork and real Safe proxies (see `CirclesV2Setup` /
+///         `HubStorageWrites` helpers). Tests cover the full module lifecycle:
+///           - Configuration & reconfiguration: `testConfigure`, `testUpdateThreshold`,
+///             `testUpdateRecoveryCooldown`, `testAddAndRemoveGuardian`,
+///             `testRemoveConfiguration`.
+///           - Guardian opt-out & edge cases: `testOptOutAsGuardian`,
+///             `testOptOut_doubleRemoveRecovery_whenInitiatorIsLastGuardian`.
+///           - Recovery flow: `testInitiateRecovery`, `testApproveAndRevokeRecovery`,
+///             `testExecuteRecovery`, `testCancelExpiredRecovery`, `testCancelRecovery`,
+///             `testRecoverWithoutMutualTrust`.
+///           - Security regressions: `testReentrancy` and `testReentrancyViaEvilGuardian`
+///             pin the post-fix of `executeRecovery` and will fail if
+///             that fix is reverted.
+/// @dev Helpers `ReentrantSafe` and `EvilGuardian` (in `./helpers/`) model an
+///      attacker-controlled Safe and an attacker-controlled guardian that can
+///      reenter SRM during module execution. Passkey creation reuses a shared
+///      P-256 key derived in `setUp()`.
+
 contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
     /// @notice The current day, calculated from the block timestamp.
     uint64 public day;
@@ -37,7 +60,7 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         guardianB = makeAddr("guardianB");
         guardianC = makeAddr("guardianC");
         guardianD = makeAddr("guardianD");
-        // 3 guardians,
+        // 4 guardians,
         _registerHuman(guardianA);
         _registerHuman(guardianB);
         _registerHuman(guardianC);
@@ -46,7 +69,7 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         _registerHuman(bob);
 
         // Shared P-256 passkey used for alice/bob Safes.
-        (sharedPubX, sharedPubY) = vm.publicKeyP256(uint256(0xBEEF));
+        (sharedPubX, sharedPubY) = vm.publicKeyP256(uint256(0xabcdefff));
 
         _simulateSafe(guardianA, false);
         _simulateSafe(guardianB, false);
@@ -65,7 +88,10 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         guardiansList[2] = guardianC;
     }
 
-    // TODO: cannot reach branch in line 832, from _setGuardiansCount line 314, because if threshold=0, it will revert in the previous check
+    /// @notice Fuzzes `configure()` over every revert branch — non-human caller,
+    ///         module disabled, invalid/over-sized threshold, cooldown below
+    ///         minimum, self-as-guardian, non-human guardian, non-mutual-trust,
+    ///         duplicates — then asserts the happy-path state and event.
     function testConfigure(uint256 _threshold, uint256 _recoveryCooldown) public {
         (uint256 threshold, uint256 recoveryCooldown, address[] memory guardians) =
             srModule.getConfiguration(address(alice));
@@ -139,6 +165,8 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         }
     }
 
+    /// @notice Fuzzes `updateThreshold`: asserts the happy-path update plus the
+    ///         `InvalidThreshold` (zero) and `ThresholdCannotBeReached` branches.
     function testUpdateThreshold(uint256 _newThreshold) public {
         (uint256 threshold, uint256 recoveryCooldown, address[] memory guardians) =
             srModule.getConfiguration(address(alice));
@@ -169,6 +197,8 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         vm.stopPrank();
     }
 
+    /// @notice Fuzzes `updateRecoveryCooldown`: covers the happy path and the
+    ///         `CooldownBelowMinimum` revert.
     function testUpdateRecoveryCooldown(uint256 _newRecoveryCooldown) public {
         vm.startPrank(alice);
         IModuleManager(alice).enableModule(address(srModule));
@@ -179,6 +209,35 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         if (_newRecoveryCooldown < minimumCooldown) {
             vm.expectRevert(SocialRecoveryModule.CooldownBelowMinimum.selector);
             srModule.updateRecoveryCooldown(_newRecoveryCooldown);
+        } else if (_newRecoveryCooldown >= (type(uint256).max) - 1) {
+            srModule.updateRecoveryCooldown(_newRecoveryCooldown);
+            vm.stopPrank();
+
+            vm.warp(block.timestamp + 1);
+
+            // initiateRecovery itself panics (overflow in RecoveryInitiated event  block.timestamp + _getRecoveryCooldown(safe))
+            address pk = _createNewPassKey(vm.randomUint());
+            vm.prank(guardianA);
+            vm.expectRevert(stdError.arithmeticError);
+            srModule.initiateRecovery(alice, pk);
+
+            // No active recovery exists, so approve/revoke revert with NoActiveRecovery (not overflow)
+            vm.prank(guardianB);
+            vm.expectRevert(SocialRecoveryModule.NoActiveRecovery.selector);
+            srModule.approveRecovery(alice);
+
+            vm.expectRevert(SocialRecoveryModule.NoActiveRecovery.selector);
+            srModule.executeRecovery(alice);
+
+            // cancelExpiredRecovery is a silent no-op
+            srModule.cancelExpiredRecovery(alice);
+
+            // Safe can still reset via updateRecoveryCooldown to a sane value
+            vm.prank(alice);
+            srModule.updateRecoveryCooldown(minimumCooldown);
+
+            vm.prank(guardianA);
+            srModule.initiateRecovery(alice, pk); // now works
         } else {
             vm.expectEmit();
             emit SocialRecoveryModule.RecoveryCooldownUpdated(address(alice), _newRecoveryCooldown);
@@ -188,7 +247,10 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         vm.stopPrank();
     }
 
-    function testAddAndRemoveGuardian(uint256 _newThreshold, address _newGuardian) public {
+    /// @notice Fuzzes `addGuardian` then `removeGuardian`, asserting the updated
+    ///         guardian list and threshold bounds (`ThresholdCannotBeReached`
+    ///         when the new threshold exceeds the resulting guardian count).
+    function testAddAndRemoveGuardian(uint256 _newThreshold) public {
         vm.assume(_newThreshold != 0);
 
         vm.startPrank(alice);
@@ -196,8 +258,6 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
 
         emit SocialRecoveryModule.ModuleConfigured(alice, 2, minimumCooldown, guardiansList.length, guardiansList);
         srModule.configure(2, minimumCooldown, guardiansList);
-
-        // TODO: If _isRecoveryActive -> create new threshold and guardian
 
         (uint256 threshold, uint256 recoveryCooldown, address[] memory guardians) =
             srModule.getConfiguration(address(alice));
@@ -243,6 +303,8 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         vm.stopPrank();
     }
 
+    /// @notice Configures the module, calls `removeConfiguration`, and asserts
+    ///         that threshold, cooldown, and guardians are all fully cleared.
     function testRemoveConfiguration() public {
         vm.startPrank(alice);
         IModuleManager(alice).enableModule(address(srModule));
@@ -267,6 +329,10 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         vm.stopPrank();
     }
 
+    /// @notice Exercises `optOutAsGuardian` across its branches: simple opt-out,
+    ///         opt-out during an active recovery (approval withdrawal vs.
+    ///         initiator cancellation), auto-threshold-reduction, and full
+    ///         configuration removal when the last guardian leaves.
     function testOptOutAsGuardian() public {
         vm.startPrank(alice);
         IModuleManager(alice).enableModule(address(srModule));
@@ -318,6 +384,48 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         srModule.optOutAsGuardian(address(alice));
     }
 
+    /// @notice Edge case where the recovery initiator is also the last remaining
+    ///         guardian after another guardian opts out. Measures the extra gas
+    ///         used by the double `_removeRecovery` / `_removeConfiguration` path.
+    function testOptOut_doubleRemoveRecovery_whenInitiatorIsLastGuardian() public {
+        guardiansList = new address[](2);
+        guardiansList[0] = guardianA;
+        guardiansList[1] = guardianB;
+        //
+        address _newPasskey = _enableModuleAndInitiateRecovery(alice, guardiansList, 2, minimumCooldown);
+
+        (
+            address initiator,
+            address newPasskey,
+            uint256 approvalCount,
+            uint256 initiationTimestamp,
+            address[] memory approvingGuardians
+        ) = srModule.getRecovery(address(alice));
+        assertEq(initiator, guardianA);
+        assertEq(newPasskey, _newPasskey);
+        assertEq(approvalCount, 1);
+        assertEq(initiationTimestamp, block.timestamp);
+        assertEq(approvingGuardians[0], guardianA);
+        assertEq(approvingGuardians.length, 1);
+
+        vm.startSnapshotGas("executeFunctionSnapshot");
+        vm.prank(guardianB);
+        srModule.optOutAsGuardian(alice);
+        uint256 gasUsed = vm.stopSnapshotGas();
+
+        console.log("Gas used by function: ", gasUsed);
+
+        vm.startSnapshotGas("executeFunctionSnapshot");
+        vm.prank(guardianA);
+        srModule.optOutAsGuardian(alice);
+        gasUsed = vm.stopSnapshotGas();
+
+        console.log("Gas used by function: ", gasUsed);
+        // Extra gas is used when initiator is also the last guardians
+    }
+
+    /// @notice Asserts happy-path `initiateRecovery` state + event, then verifies
+    ///         a second call reverts with `RecoveryAlreadyActive`.
     function testInitiateRecovery() public {
         vm.startPrank(alice);
         IModuleManager(alice).enableModule(address(srModule));
@@ -363,12 +471,11 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         srModule.initiateRecovery(address(alice), newPasskey);
     }
 
+    /// @notice Walks the full approve / revoke cycle: duplicate-approval revert,
+    ///         threshold-reached event, initiator revoke cancels the recovery,
+    ///         non-initiator revoke drops approval and emits `RecoveryThresholdLost`.
     function testApproveAndRevokeRecovery() public {
-        address guardianD = makeAddr("guardianD");
-        _registerHuman(guardianD);
-        _createMutualTrust(alice, guardianD);
-
-        address[] memory guardiansList = new address[](4);
+        guardiansList = new address[](4);
         guardiansList[0] = guardianA;
         guardiansList[1] = guardianB;
         guardiansList[2] = guardianC;
@@ -450,6 +557,9 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         srModule.revokeRecoveryApproval(address(alice));
     }
 
+    /// @notice Happy-path `executeRecovery`: after cooldown and threshold are met,
+    ///         the new passkey is added as a Safe owner and the `RecoveryExecuted`
+    ///         event carries the full approving-guardians list.
     function testExecuteRecovery() public {
         address _newPasskey = _enableModuleAndInitiateRecovery(alice, guardiansList, 2, minimumCooldown);
 
@@ -514,6 +624,10 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         srModule.executeRecovery(address(alice));
     }
 
+    /// @notice Verifies `cancelExpiredRecovery` is a no-op before the cooldown
+    ///         ends and clears recovery state + emits
+    ///         `RecoveryExpiredInsufficientApprovals` once expired without
+    ///         reaching threshold.
     function testCancelExpiredRecovery() public {
         address _newPasskey =
             _enableModuleAndInitiateRecovery(alice, guardiansList, guardiansList.length, minimumCooldown);
@@ -561,6 +675,9 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         assertEq(initiationTimestamp, 0);
     }
 
+    /// @notice Safe cancels its own active recovery via `cancelRecovery()` and
+    ///         asserts recovery state is fully cleared plus the
+    ///         `RecoveryCanceledBySafe` event.
     function testCancelRecovery() public {
         address _newPasskey =
             _enableModuleAndInitiateRecovery(alice, guardiansList, guardiansList.length, minimumCooldown);
@@ -595,43 +712,254 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
     // Helper function
     function _enableModuleAndInitiateRecovery(
         address _user,
-        address[] memory guardiansList,
+        address[] memory _guardiansList,
         uint256 _threshold,
         uint256 _minimumCooldown
     ) internal returns (address _newPasskey) {
         vm.startPrank(_user);
         IModuleManager(_user).enableModule(address(srModule));
 
-        srModule.configure(_threshold, _minimumCooldown, guardiansList);
+        srModule.configure(_threshold, _minimumCooldown, _guardiansList);
 
         (uint256 threshold, uint256 recoveryCooldown, address[] memory guardians) =
             srModule.getConfiguration(address(alice));
         assertEq(threshold, _threshold);
         assertEq(recoveryCooldown, _minimumCooldown);
-        assertEq(guardians.length, guardiansList.length);
+        assertEq(guardians.length, _guardiansList.length);
         vm.stopPrank();
 
         _newPasskey = _createNewPassKey(vm.randomUint());
 
-        vm.prank(guardiansList[0]);
+        vm.prank(_guardiansList[0]);
         vm.expectEmit();
         emit SocialRecoveryModule.RecoveryInitiated(
-            _user, guardiansList[0], _newPasskey, block.timestamp, block.timestamp + recoveryCooldown
+            _user, _guardiansList[0], _newPasskey, block.timestamp, block.timestamp + recoveryCooldown
         );
 
         srModule.initiateRecovery(address(_user), _newPasskey);
     }
 
-    function testReadLinkedList() public {
-        address _newPasskey =
-            _enableModuleAndInitiateRecovery(alice, guardiansList, guardiansList.length, minimumCooldown);
+    // Suggestion: should revert if guardian don't have mutual trust when initiateRecovery/approveRecovery/executeRecovery is called
+    /// @notice Documents that recovery still succeeds after the mutual-trust
+    ///         relationship between a guardian and the Safe is removed in the
+    ///         Circles Hub — mutual trust is only enforced at
+    ///         configure time, not at recovery time.
+    function testRecoverWithoutMutualTrust() public {
+        vm.startPrank(alice);
+        IModuleManager(alice).enableModule(address(srModule));
 
-        (
-            address initiator,
-            address newPasskey,
-            uint256 approvalCount,
-            uint256 initiationTimestamp,
-            address[] memory approvingGuardians
-        ) = srModule.getRecovery(address(alice));
+        srModule.configure(2, minimumCooldown, guardiansList);
+
+        (uint256 threshold, uint256 recoveryCooldown, address[] memory guardians) =
+            srModule.getConfiguration(address(alice));
+        assertEq(threshold, 2);
+        assertEq(recoveryCooldown, minimumCooldown);
+        assertEq(guardians.length, guardiansList.length);
+
+        HUB_V2.trust(guardiansList[0], uint96(block.timestamp));
+        HUB_V2.trust(guardiansList[1], uint96(block.timestamp));
+        HUB_V2.trust(guardiansList[2], uint96(block.timestamp));
+        vm.stopPrank();
+
+        vm.prank(guardiansList[0]);
+        HUB_V2.trust(alice, uint96(block.timestamp));
+
+        vm.warp(block.timestamp + 1);
+        address newPasskey = _createNewPassKey(vm.randomUint());
+
+        vm.prank(guardiansList[2]);
+        srModule.initiateRecovery(alice, newPasskey);
+
+        vm.prank(guardiansList[1]);
+        srModule.approveRecovery(alice);
+
+        vm.prank(guardiansList[0]);
+        srModule.approveRecovery(alice);
+
+        vm.warp(block.timestamp + recoveryCooldown);
+        vm.prank(bob);
+        vm.expectEmit();
+        emit SocialRecoveryModule.RecoveryExecuted(alice, newPasskey, guardiansList);
+        srModule.executeRecovery(alice);
+    }
+
+    /// @dev    A malicious Safe still reenters SRM with cancelRecovery() during the module's
+    ///         execTransactionFromModuleReturnData call, but after the fix the effects
+    ///         (_removeRecovery + approvers snapshot) run BEFORE the external call. So:
+    ///           - the reentrant cancelRecovery() sees no active recovery and is a silent
+    ///             no-op (no RecoveryCanceledBySafe event emitted),
+    ///           - the outer RecoveryExecuted event carries the full approving-guardians
+    ///             array captured pre-interaction.
+    ///         On the original contract the inverse held: RecoveryCanceledBySafe
+    ///         fired before RecoveryExecuted and the latter carried an empty guardians
+    ///         array. The assertions below would fail on that original contract.
+    function testReentrancy() public {
+        ReentrantSafe evilSafe = new ReentrantSafe(srModule);
+
+        _registerHuman(address(evilSafe));
+        _createMutualTrust(guardianA, address(evilSafe));
+        _createMutualTrust(guardianB, address(evilSafe));
+        _createMutualTrust(guardianC, address(evilSafe));
+
+        vm.prank(address(evilSafe));
+        srModule.configure(2, minimumCooldown, guardiansList);
+
+        address newPasskey = _createNewPassKey(vm.randomUint());
+
+        vm.prank(guardianA);
+        srModule.initiateRecovery(address(evilSafe), newPasskey);
+
+        vm.prank(guardianB);
+        srModule.approveRecovery(address(evilSafe));
+
+        vm.warp(block.timestamp + minimumCooldown + 1);
+
+        evilSafe.arm(address(srModule), abi.encodeCall(srModule.cancelRecovery, ()));
+
+        vm.recordLogs();
+        srModule.executeRecovery(address(evilSafe));
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+
+        assertTrue(evilSafe.reentered(), "reentry did not fire");
+        assertTrue(evilSafe.reenterSuccess(), "reentrant cancelRecovery reverted");
+
+        bytes32 executedSig = keccak256("RecoveryExecuted(address,address,address[])");
+        bytes32 canceledSig = keccak256("RecoveryCanceledBySafe(address)");
+
+        bool sawExecuted;
+        bool sawCanceled;
+        for (uint256 i; i < entries.length; ++i) {
+            bytes32 sig = entries[i].topics[0];
+            if (sig == canceledSig) sawCanceled = true;
+            if (sig == executedSig) {
+                sawExecuted = true;
+                (address[] memory emittedGuardians) = abi.decode(entries[i].data, (address[]));
+                // Post-fix: approvers were snapshotted before _removeRecovery, so the
+                // full approving-guardians list must be emitted. On the original
+                // contract this array was empty — so this assertion guards the fix.
+                assertEq(
+                    emittedGuardians.length,
+                    2,
+                    "RecoveryExecuted must emit the snapshotted approvers (regression on pre-fix contract)"
+                );
+            }
+        }
+        // Post-fix: reentrant cancelRecovery() is a silent no-op because state was
+        // already cleared. The original contract emitted RecoveryCanceledBySafe
+        // before RecoveryExecuted — so this assertion also regresses on the old code.
+        assertFalse(sawCanceled, "RecoveryCanceledBySafe must not fire: state cleared before external call");
+        assertTrue(sawExecuted, "RecoveryExecuted not emitted");
+
+        (address initiator,, uint256 approvalCount,,) = srModule.getRecovery(address(evilSafe));
+        assertEq(initiator, address(0), "recovery state should be cleared");
+        assertEq(approvalCount, 0, "approval count should be cleared");
+
+        assertEq(evilSafe.ownersLength(), 1, "addOwnerWithThreshold should still have executed");
+        assertEq(evilSafe.ownerAt(0), newPasskey, "added owner should be the proposed passkey");
+    }
+
+    /// @dev    During executeRecovery the Safe still calls evilGuardian.trigger(), which
+    ///         reenters SRM as `optOutAsGuardian(evilSafe)`. Post-fix, recovery state
+    ///         was cleared BEFORE the external call, so inside optOutAsGuardian
+    ///         `activeRecovery` is false: the initiator-opt-out branch is skipped
+    ///         (no RecoveryCanceledByInitiatorOptOut), but guardian removal still runs
+    ///         (GuardianOptedOut is still emitted). The outer RecoveryExecuted event
+    ///         carries the snapshotted approvers list. The original contract
+    ///         would emit RecoveryCanceledByInitiatorOptOut before RecoveryExecuted
+    ///         and produce an empty approvers array — so these assertions regress on
+    ///         the pre-fix code.
+    function testReentrancyViaEvilGuardian() public {
+        ReentrantSafe evilSafe = new ReentrantSafe(srModule);
+        EvilGuardian evilGuardian = new EvilGuardian(srModule);
+
+        _registerHuman(address(evilSafe));
+        _registerHuman(address(evilGuardian));
+
+        _createMutualTrust(address(evilGuardian), address(evilSafe));
+        _createMutualTrust(guardianA, address(evilSafe));
+        _createMutualTrust(guardianB, address(evilSafe));
+
+        address[] memory guardians = new address[](3);
+        guardians[0] = address(evilGuardian);
+        guardians[1] = guardianA;
+        guardians[2] = guardianB;
+
+        vm.prank(address(evilSafe));
+        srModule.configure(2, minimumCooldown, guardians);
+
+        address newPasskey = _createNewPassKey(vm.randomUint());
+
+        // evilGuardian initiates so the initiator-opt-out branch clears recovery state.
+        vm.prank(address(evilGuardian));
+        srModule.initiateRecovery(address(evilSafe), newPasskey);
+
+        vm.prank(guardianA);
+        srModule.approveRecovery(address(evilSafe));
+
+        vm.warp(block.timestamp + minimumCooldown + 1);
+
+        // Arm: evilGuardian calls SRM.optOutAsGuardian(evilSafe) when triggered.
+        evilGuardian.arm(abi.encodeCall(srModule.optOutAsGuardian, (address(evilSafe))));
+        // Arm: evilSafe routes its reentry through evilGuardian.trigger().
+        evilSafe.arm(address(evilGuardian), abi.encodeCall(EvilGuardian.trigger, ()));
+
+        vm.recordLogs();
+        srModule.executeRecovery(address(evilSafe));
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+
+        assertTrue(evilSafe.reentered(), "safe-level reentry did not fire");
+        assertTrue(evilSafe.reenterSuccess(), "evilGuardian.trigger call reverted");
+        assertTrue(evilGuardian.fired(), "evilGuardian.trigger did not run");
+        assertTrue(evilGuardian.triggerSuccess(), "optOutAsGuardian reverted in reentry");
+
+        bytes32 executedSig = keccak256("RecoveryExecuted(address,address,address[])");
+        bytes32 initiatorOptOutSig = keccak256("RecoveryCanceledByInitiatorOptOut(address)");
+        bytes32 guardianOptedOutSig = keccak256("GuardianOptedOut(address,address)");
+
+        bool sawExecuted;
+        bool sawInitiatorOptOut;
+        bool sawGuardianOptedOutBeforeExecuted;
+        for (uint256 i; i < entries.length; ++i) {
+            bytes32 sig = entries[i].topics[0];
+            if (sig == initiatorOptOutSig) sawInitiatorOptOut = true;
+            if (!sawExecuted && sig == guardianOptedOutSig) sawGuardianOptedOutBeforeExecuted = true;
+            if (sig == executedSig) {
+                sawExecuted = true;
+                (address[] memory emittedGuardians) = abi.decode(entries[i].data, (address[]));
+                // Post-fix: snapshot captured [evilGuardian, guardianA] before clearing.
+                // Pre-fix would have been empty — so this pins the fix.
+                assertEq(
+                    emittedGuardians.length,
+                    2,
+                    "RecoveryExecuted must emit the snapshotted approvers (regression on pre-fix contract)"
+                );
+            }
+        }
+        // Post-fix: inside the reentrant optOutAsGuardian, _isRecoveryActive is false,
+        // so the initiator-opt-out branch is skipped entirely (no event). The original
+        // buggy contract emitted this — so this assertion also regresses on old code.
+        assertFalse(
+            sawInitiatorOptOut, "RecoveryCanceledByInitiatorOptOut must not fire: state cleared before external call"
+        );
+        // Guardian removal still runs in both cases — evilGuardian is a guardian, still
+        // gets opted out from the set.
+        assertTrue(sawGuardianOptedOutBeforeExecuted, "GuardianOptedOut must fire before RecoveryExecuted");
+        assertTrue(sawExecuted, "RecoveryExecuted not emitted");
+
+        // Recovery state cleared.
+        (address initiator,, uint256 approvalCount,,) = srModule.getRecovery(address(evilSafe));
+        assertEq(initiator, address(0));
+        assertEq(approvalCount, 0);
+
+        // evilGuardian has been removed from the guardian set mid-execute.
+        (,, address[] memory finalGuardians) = srModule.getConfiguration(address(evilSafe));
+        assertEq(finalGuardians.length, 2, "evilGuardian should be removed from guardian set");
+        for (uint256 i; i < finalGuardians.length; ++i) {
+            assertTrue(finalGuardians[i] != address(evilGuardian), "evilGuardian should not remain in guardian list");
+        }
+
+        // Passkey was still added as owner — the Safe-side call completed.
+        assertEq(evilSafe.ownersLength(), 1);
+        assertEq(evilSafe.ownerAt(0), newPasskey);
     }
 }
