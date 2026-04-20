@@ -701,9 +701,12 @@ contract SocialRecoveryModule {
     /// @return linkedList In-memory array containing list elements in traversal order.
     function _getLinkedList(address next, uint256 initSlot) internal view returns (address[] memory linkedList) {
         assembly {
+            // Store the mapping storage slot
             mstore(0x20, initSlot)
             // Store the array at the free memory location
             linkedList := mload(0x40)
+            // clean linked list word
+            mstore(linkedList, 0x0000000000000000000000000000000000000000000000000000000000000000)
             // Update free memory pointer
             mstore(0x40, add(mload(0x40), 0x20))
             // Start with the first node from solidity

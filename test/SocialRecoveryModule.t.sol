@@ -44,12 +44,16 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         _registerHuman(guardianD);
         _registerHuman(alice);
         _registerHuman(bob);
-        _simulateSafe(guardianA);
-        _simulateSafe(guardianB);
-        _simulateSafe(guardianC);
-        _simulateSafe(guardianD);
-        _simulateSafe(alice);
-        _simulateSafe(bob);
+
+        // Shared P-256 passkey used for alice/bob Safes.
+        (sharedPubX, sharedPubY) = vm.publicKeyP256(uint256(0xBEEF));
+
+        _simulateSafe(guardianA, false);
+        _simulateSafe(guardianB, false);
+        _simulateSafe(guardianC, false);
+        _simulateSafe(guardianD, false);
+        _simulateSafe(alice, true);
+        _simulateSafe(bob, true);
 
         _createMutualTrust(guardianA, alice);
         _createMutualTrust(guardianB, alice);
