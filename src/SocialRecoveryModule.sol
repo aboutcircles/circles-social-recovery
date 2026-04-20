@@ -538,19 +538,17 @@ contract SocialRecoveryModule {
             revert RecoveryPeriodNotEnded();
         }
 
-        if (_getApprovalCount(safe) >= _getThreshold(safe)) {
-            address newPasskey = _getNewPasskey(safe);
-            _addRecoveryOwner(safe, newPasskey);
+        bool ok = _getApprovalCount(safe) >= _getThreshold(safe);
+        address newPasskey = _getNewPasskey(safe);
+        address[] memory approvers = _getArrayFromList(_approvingGuardiansSlot(safe), _getApprovingGuardiansList(safe));
 
-            emit RecoveryExecuted(
-                safe, newPasskey, _getArrayFromList(_approvingGuardiansSlot(safe), _getApprovingGuardiansList(safe))
-            );
+        _removeRecovery(safe);
+        if (ok) {
+            _addRecoveryOwner(safe, newPasskey);
+            emit RecoveryExecuted(safe, newPasskey, approvers);
         } else {
             emit RecoveryExpiredInsufficientApprovals(safe);
         }
-
-        // clean
-        _removeRecovery(safe);
     }
 
     /// @notice Cancels an expired recovery that failed to reach threshold.
