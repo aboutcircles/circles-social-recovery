@@ -31,8 +31,7 @@ contract HubStorageWrites is Test {
     bytes32 internal constant FALLBACK_HANDLER_SLOT =
         0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5;
     // SafeWebAuthnSharedSigner SIGNER_SLOT (per-Safe storage written via delegatecall layout)
-    uint256 internal constant SIGNER_SLOT =
-        0x553c9d7e83c58cdf3a427b0c81460372fe0d5da8900473788d506425c7ffdc5a;
+    uint256 internal constant SIGNER_SLOT = 0x553c9d7e83c58cdf3a427b0c81460372fe0d5da8900473788d506425c7ffdc5a;
 
     // Safe 1.4.1 storage slot layout
     uint256 private constant SAFE_SLOT_SINGLETON = 0;

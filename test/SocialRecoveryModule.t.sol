@@ -622,9 +622,8 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         srModule.initiateRecovery(address(_user), _newPasskey);
     }
 
-    function testReadLinkedList() public{
-
-            address _newPasskey =
+    function testReadLinkedList() public {
+        address _newPasskey =
             _enableModuleAndInitiateRecovery(alice, guardiansList, guardiansList.length, minimumCooldown);
 
         (
