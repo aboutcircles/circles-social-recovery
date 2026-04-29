@@ -400,17 +400,34 @@ contract SocialRecoveryModule {
 
     /// @notice Lets a guardian opt out from guarding a Safe.
     /// @dev
-    /// If the guardian is the initiator of an active recovery, the recovery is canceled.
-    /// If the guardian had approved an active recovery, that approval is removed.
-    /// If opt-out leaves no guardians, the full configuration is removed.
-    /// If opt-out would make the current threshold unreachable, the threshold is automatically reduced.
+    /// Requirements:
+    /// - The Safe must be configured.
+    /// - The caller must be a guardian of the Safe.
+    ///
+    /// Behavior in priority order:
+    /// - If a recovery is active and still within the cooldown window:
+    ///   - If the caller initiated the recovery, the recovery is canceled and `RecoveryCanceledByInitiatorOptOut`
+    ///     is emitted.
+    ///   - Otherwise, if the caller had approved the recovery, the approval is revoked and the approval count is
+    ///     decremented; `RecoveryThresholdLost` is emitted if approvals fall from at/above to below threshold and
+    ///     the threshold remains reachable after the opt-out.
+    /// - If the caller is the only remaining guardian, any active recovery is cleared and the full configuration
+    ///   is removed (`ConfigurationRemovedOnGuardianOptOut` is emitted); the function returns early.
+    /// - Otherwise, if the current threshold would become unreachable after removal
+    ///   (threshold > guardiansCount - 1), the threshold is auto-reduced by one and
+    ///   `ThresholdAutoReducedOnGuardianOptOut` is emitted; if the remaining approval count meets the reduced
+    ///   threshold, `RecoveryThresholdReached` is emitted.
+    /// - The guardian is then removed from the Safe's guardian list and from its own wards index, the guardian
+    ///   count is decremented, and `GuardianOptedOut` is emitted.
     /// @param safe Safe from which the caller wants to opt out as guardian.
     function optOutAsGuardian(address safe) external onlyConfigured(safe) onlyGuardian(safe, msg.sender) {
         address guardian = msg.sender;
         bool activeRecovery = _isRecoveryActive(safe);
         uint256 threshold = _getThreshold(safe);
         uint256 guardiansCount = _getGuardiansCount(safe);
-        if (activeRecovery) {
+        uint256 approvalCount = _getApprovalCount(safe);
+
+        if (activeRecovery && block.timestamp < _getRecoveryCooldown(safe) + _getInitiationTimestamp(safe)) {
             if (guardian == _getInitiator(safe)) {
                 // if guardian is initiator and opts out - cancel initiated recovery
                 _removeRecovery(safe);
@@ -418,9 +435,10 @@ contract SocialRecoveryModule {
             } else {
                 mapping(address => address) storage approvingGuardians = _getApprovingGuardiansList(safe);
                 if (_isInLinkedList(guardian, approvingGuardians)) {
+                    // Only remove if within cooldown period
                     // if approved recovery - revoke approval
                     _removeFromLinkedList(guardian, approvingGuardians);
-                    uint256 approvalCount = _getApprovalCount(safe);
+
                     uint256 newApprovalCount = approvalCount - uint256(1);
                     if (approvalCount >= threshold && newApprovalCount < threshold && threshold <= guardiansCount - 1) {
                         emit RecoveryThresholdLost(safe);
@@ -429,6 +447,8 @@ contract SocialRecoveryModule {
                 }
             }
         }
+
+        // if guardians is 1 and the only guardian want to opt out, no matter what, the configuration is removed
         if (guardiansCount == 1) {
             if (activeRecovery) _removeRecovery(safe);
             // remove configuration
@@ -441,6 +461,10 @@ contract SocialRecoveryModule {
             // enforce threshold drop
             _setThreshold(safe, threshold - 1);
             emit ThresholdAutoReducedOnGuardianOptOut(safe, guardian, threshold - 1);
+
+            if (approvalCount >= threshold - 1) {
+                emit RecoveryThresholdReached(safe);
+            }
         }
 
         _removeFromLinkedList(guardian, _getGuardiansList(safe));

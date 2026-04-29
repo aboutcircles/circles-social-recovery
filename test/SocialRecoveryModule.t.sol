@@ -364,9 +364,17 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         srModule.initiateRecovery(address(alice), newPasskey);
 
         vm.prank(guardianC);
-        vm.expectEmit();
-        emit SocialRecoveryModule.ThresholdAutoReducedOnGuardianOptOut(address(alice), guardianC, threshold - 1);
+        vm.recordLogs();
+
         srModule.optOutAsGuardian(address(alice));
+
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        assertEq(entries.length, 4);
+
+        // emit SocialRecoveryModule.ThresholdAutoReducedOnGuardianOptOut(address(alice), guardianC, threshold - 1);
+        // emit ThresholdUpdated(safe: alice, threshold: 1)
+        // emit RecoveryThresholdReached(safe: alice)
+        // emit GuardianOptedOut(safe: alice, guardian: guardianC)
 
         vm.prank(guardianB);
         vm.expectEmit();
@@ -382,6 +390,106 @@ contract SocialRecoveryModuleTest is CirclesV2Setup, HubStorageWrites {
         vm.expectEmit();
         emit SocialRecoveryModule.ConfigurationRemovedOnGuardianOptOut(address(alice), guardianA);
         srModule.optOutAsGuardian(address(alice));
+    }
+
+    function testOptOutAsGuardianAfterCooldown() public {
+        guardiansList = new address[](3);
+        guardiansList[0] = guardianA;
+        guardiansList[1] = guardianB;
+        guardiansList[2] = guardianC;
+
+        address _newPasskey = _enableModuleAndInitiateRecovery(alice, guardiansList, 3, minimumCooldown);
+
+        (
+            address initiator,
+            address newPasskey,
+            uint256 approvalCount,
+            uint256 initiationTimestamp,
+            address[] memory approvingGuardians
+        ) = srModule.getRecovery(address(alice));
+        assertEq(initiator, guardianA);
+        assertEq(newPasskey, _newPasskey);
+        assertEq(approvalCount, 1);
+        assertEq(initiationTimestamp, block.timestamp);
+        assertEq(approvingGuardians[0], guardianA);
+        assertEq(approvingGuardians.length, 1);
+        // approval 2/3
+        vm.prank(guardianB);
+        srModule.approveRecovery(address(alice));
+        (initiator, newPasskey, approvalCount, initiationTimestamp, approvingGuardians) =
+            srModule.getRecovery(address(alice));
+        assertEq(initiator, guardianA);
+        assertEq(newPasskey, _newPasskey);
+        assertEq(approvalCount, 2);
+        assertEq(initiationTimestamp, block.timestamp);
+        assertEq(approvingGuardians[0], guardianB);
+        assertEq(approvingGuardians[1], guardianA);
+        assertEq(approvingGuardians.length, 2);
+        (uint256 threshold, uint256 recoveryCooldown, address[] memory guardians) =
+            srModule.getConfiguration(address(alice));
+        assertEq(threshold, 3);
+        assertEq(recoveryCooldown, minimumCooldown);
+        assertEq(guardians[0], guardianC);
+        assertEq(guardians[1], guardianB);
+        assertEq(guardians[2], guardianA);
+
+        // guardianB wants to opt out after cooldown period
+        vm.warp(block.timestamp + minimumCooldown + 1);
+
+        vm.prank(guardianB);
+        vm.expectEmit();
+        emit SocialRecoveryModule.RecoveryThresholdReached(address(alice));
+        srModule.optOutAsGuardian(address(alice));
+
+        // approval 2/2
+        (initiator, newPasskey, approvalCount, initiationTimestamp, approvingGuardians) =
+            srModule.getRecovery(address(alice));
+        assertEq(initiator, guardianA);
+        assertEq(newPasskey, _newPasskey);
+        assertEq(approvalCount, 2);
+        assertEq(initiationTimestamp, block.timestamp - minimumCooldown - 1);
+        assertEq(approvingGuardians[0], guardianB);
+        assertEq(approvingGuardians[1], guardianA);
+        assertEq(approvingGuardians.length, 2);
+        (threshold, recoveryCooldown, guardians) = srModule.getConfiguration(address(alice));
+        assertEq(threshold, 2);
+        assertEq(recoveryCooldown, minimumCooldown);
+        assertEq(guardians[0], guardianC);
+        assertEq(guardians[1], guardianA);
+
+        // C opt out as guardian
+        vm.prank(guardianC);
+        vm.expectEmit();
+        emit SocialRecoveryModule.RecoveryThresholdReached(address(alice));
+        srModule.optOutAsGuardian(address(alice));
+
+        // approval 2/1
+        (initiator, newPasskey, approvalCount, initiationTimestamp, approvingGuardians) =
+            srModule.getRecovery(address(alice));
+        assertEq(initiator, guardianA);
+        assertEq(newPasskey, _newPasskey);
+        assertEq(approvalCount, 2);
+        assertEq(initiationTimestamp, block.timestamp - minimumCooldown - 1);
+        assertEq(approvingGuardians[0], guardianB);
+        assertEq(approvingGuardians[1], guardianA);
+        assertEq(approvingGuardians.length, 2);
+
+        (threshold, recoveryCooldown, guardians) = srModule.getConfiguration(address(alice));
+        assertEq(threshold, 1);
+        assertEq(recoveryCooldown, minimumCooldown);
+        assertEq(guardians[0], guardianA);
+
+        // After the cooldownperiod, even though guardianA is the initiator, allow to remove recovery and configuration anyway
+        vm.prank(guardianA);
+        vm.expectEmit();
+        emit SocialRecoveryModule.ConfigurationRemovedOnGuardianOptOut(address(alice), guardianA);
+
+        srModule.optOutAsGuardian(address(alice));
+
+        (threshold, recoveryCooldown, guardians) = srModule.getConfiguration(address(alice));
+        assertEq(threshold, 0);
+        assertEq(recoveryCooldown, 0);
+        assertEq(guardians.length, 0);
     }
 
     /// @notice Edge case where the recovery initiator is also the last remaining
